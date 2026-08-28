@@ -2,8 +2,10 @@
   "use strict";
 
   let stopRequested = false;
-  const VERSION = "2026-08-28.4";
-  const WAIT = 750;
+  const VERSION = "2026-08-28.5";
+  const SETTLE = 180;
+  const COMMIT_TIMEOUT = 3500;
+  const ATTENDANCE_TIMEOUT = 1800;
   const ATTEMPTS = 3;
   const runWarnings = [];
   const confirmedAttendance = new Map();
@@ -91,7 +93,7 @@
       }
 
       key(element, character, code, number);
-      await sleep(35);
+      await sleep(18);
     }
   }
 
@@ -350,6 +352,42 @@
     );
   }
 
+  function currentControls(base, row) {
+    try {
+      return controls(base, row);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function waitForRowState(
+    base,
+    row,
+    label,
+    predicate,
+    timeout = COMMIT_TIMEOUT,
+  ) {
+    await sleep(SETTLE);
+    return waitFor(
+      () => {
+        const rowControls = currentControls(base, row);
+        return rowControls && predicate(rowControls) ? rowControls : null;
+      },
+      `Row ${row + 1} ${label}`,
+      timeout,
+    );
+  }
+
+  function hourValueMatches(field, expected) {
+    const observed = clean(field?.value);
+    const original = clean(expected);
+    const numeric = Number(expected);
+    return (
+      observed === original ||
+      (Number.isFinite(numeric) && observed === numeric.toFixed(2))
+    );
+  }
+
   function controlDescription(field) {
     return {
       id: clean(field?.id),
@@ -433,15 +471,18 @@
         // Printable keyboard events drive the combo's native type-ahead, and
         // Enter commits the highlighted item into lsdata (key 4/text 5).
         if (isSapCombo(field)) {
-          await sleep(300);
+          await sleep(120);
 
           let exactOption = null;
-          if (attempt !== 2) {
+          // Keyboard type-ahead is fastest and is now the primary route.
+          // Use an exact DOM click only on the second attempt as an independent
+          // fallback for SAP builds that ignore synthetic printable keys.
+          if (attempt === 2) {
             try {
               exactOption = await waitFor(
                 () => option(expected, field),
                 `Row ${row + 1} exact Attendance option ${expected}`,
-                1800,
+                550,
               );
             } catch (error) {
               if (error?.name === "StopError") throw error;
@@ -451,37 +492,28 @@
           if (exactOption) {
             click(exactOption);
           } else {
-            // The second attempt deliberately uses the independent keyboard
-            // route even if a matching DOM node was seen on attempt one.
             field.focus();
             await typeKeys(field, expected);
-            await sleep(250);
+            await sleep(80);
             enter(field);
           }
-          await sleep(WAIT);
 
-          rowControls = await live(
+          rowControls = await waitForRowState(
             base,
             row,
             `Attendance combo verification attempt ${attempt}`,
+            (controlsNow) =>
+              attendanceValueMatches(controlsNow.attendance, expected),
+            ATTENDANCE_TIMEOUT,
           );
           lastObserved = clean(rowControls.attendance.value);
 
-          if (attendanceValueMatches(rowControls.attendance, expected)) {
-            confirmedAttendance.set(base, {
-              expected: comparable(expected),
-              display: lastObserved,
-            });
-            rowControls.mo.focus();
-            await sleep(150);
-            return rowControls;
-          }
-
-          const state = comboState(rowControls.attendance);
-          throw Error(
-            `combo did not commit; value=${JSON.stringify(lastObserved)}, ` +
-              `key=${JSON.stringify(state.key)}, text=${JSON.stringify(state.text)}`,
-          );
+          confirmedAttendance.set(base, {
+            expected: comparable(expected),
+            display: lastObserved,
+          });
+          rowControls.mo.focus();
+          return rowControls;
         }
 
         let helpState;
@@ -502,7 +534,7 @@
               return { editor: editor || field };
             },
             `Row ${row + 1} Attendance value help`,
-            3000,
+            1200,
           );
         } catch (error) {
           if (error?.name === "StopError") throw error;
@@ -526,7 +558,7 @@
             exactOption = await waitFor(
               () => option(expected, field),
               `Row ${row + 1} Attendance option ${expected}`,
-              1800,
+              700,
             );
           } catch (error) {
             if (error?.name === "StopError") throw error;
@@ -540,11 +572,14 @@
           }
         }
 
-        await sleep(WAIT);
-        rowControls = await live(
+        rowControls = await waitForRowState(
           base,
           row,
           `Attendance verification attempt ${attempt}`,
+          (controlsNow) =>
+            attendanceValueMatches(controlsNow.attendance, expected) ||
+            (selectedExactOption && clean(controlsNow.attendance.value) !== ""),
+          ATTENDANCE_TIMEOUT,
         );
         lastObserved = clean(rowControls.attendance.value);
 
@@ -557,7 +592,6 @@
             display: lastObserved,
           });
           rowControls.mo.focus();
-          await sleep(150);
           return rowControls;
         }
 
@@ -568,7 +602,7 @@
         if (error?.name === "StopError") throw error;
         lastError = error;
         esc(document.activeElement || document.body);
-        await sleep(300 + attempt * 150);
+        await sleep(120 + attempt * 80);
       }
     }
 
@@ -591,8 +625,13 @@
 
       if (clean(rowControls.activity.value) !== clean(data.activity)) {
         submit(rowControls.activity, data.activity);
-        await sleep(WAIT);
-        rowControls = await live(base, row, `${label} Activity verification`);
+        rowControls = await waitForRowState(
+          base,
+          row,
+          `${label} Activity verification`,
+          (controlsNow) =>
+            clean(controlsNow.activity.value) === clean(data.activity),
+        );
       }
 
       if (
@@ -716,41 +755,97 @@
     return false;
   }
 
-  async function findNextEmptyEngagementRow() {
-    return waitFor(
-      () => {
-        const rows = anchors();
-        const rowIndex = rows.findIndex((anchor) => clean(anchor.value) === "");
-        if (rowIndex === -1) return null;
+  function emptyDestination() {
+    const rows = anchors();
+    const rowIndex = rows.findIndex((anchor) => clean(anchor.value) === "");
+    if (rowIndex === -1) return null;
 
-        const anchor = rows[rowIndex];
-        return anchor.isConnected &&
-          visible(anchor) &&
-          !anchor.disabled &&
-          !anchor.readOnly
-          ? { rowIndex, anchorId: anchor.id }
-          : null;
-      },
-      "next empty Engagement ID row",
-      7000,
-    );
+    const anchor = rows[rowIndex];
+    return anchor.isConnected &&
+      visible(anchor) &&
+      !anchor.disabled &&
+      !anchor.readOnly
+      ? { rowIndex, anchorId: anchor.id }
+      : null;
   }
 
-  async function process(data, row) {
-    const anchor = anchors()[row];
-    if (!anchor) throw Error(`Mercury row ${row + 1} missing.`);
-    if (clean(anchor.value) !== "")
-      throw Error(`Mercury row ${row + 1} is no longer empty.`);
+  function anchorSnapshot() {
+    return anchors()
+      .map((anchor) => `${anchor.id}:${clean(anchor.value)}`)
+      .join("|");
+  }
 
-    const base = anchor.id;
+  async function findNextEmptyEngagementRow() {
+    for (let scrollAttempt = 0; scrollAttempt < 50; scrollAttempt++) {
+      checkStopped();
+      const destination = emptyDestination();
+      if (destination) return destination;
+
+      const scrollDown = document.getElementById("WD023A-scrollV-Nxt");
+      if (!scrollDown)
+        throw Error("Mercury vertical scroll-down button not found.");
+
+      const before = anchorSnapshot();
+      click(scrollDown);
+
+      try {
+        const result = await waitFor(
+          () => {
+            const empty = emptyDestination();
+            if (empty) return { destination: empty };
+            return anchorSnapshot() !== before ? { changed: true } : null;
+          },
+          "Mercury row grid to scroll",
+          650,
+        );
+        if (result.destination) return result.destination;
+      } catch (error) {
+        if (error?.name === "StopError") throw error;
+        if (
+          scrollDown.disabled ||
+          comparable(scrollDown.getAttribute("aria-disabled")) === "true"
+        ) {
+          throw Error("No additional empty Mercury timesheet row is available.");
+        }
+      }
+    }
+
+    throw Error("Unable to locate an empty Mercury timesheet row.");
+  }
+
+  async function process(data, destination) {
+    const row = destination.rowIndex;
+    const anchor = document.getElementById(destination.anchorId);
+    if (!anchor || !anchor.isConnected || !visible(anchor)) {
+      throw Error(
+        `Reserved Mercury row ${row + 1} (${destination.anchorId}) disappeared.`,
+      );
+    }
+    if (clean(anchor.value) !== "") {
+      throw Error(
+        `Reserved Mercury row ${row + 1} (${destination.anchorId}) is no longer empty.`,
+      );
+    }
+
+    const base = destination.anchorId;
     confirmedAttendance.delete(base);
 
     submit(anchor, data.engagement);
-    await sleep(WAIT);
-
-    let rowControls = await live(base, row, "Activity");
+    let rowControls = await waitForRowState(
+      base,
+      row,
+      "Engagement verification",
+      (controlsNow) =>
+        clean(controlsNow.anchor.value) === clean(data.engagement),
+    );
     submit(rowControls.activity, data.activity);
-    await sleep(WAIT);
+    rowControls = await waitForRowState(
+      base,
+      row,
+      "Activity verification",
+      (controlsNow) =>
+        clean(controlsNow.activity.value) === clean(data.activity),
+    );
     await ensureRowContext(data, row, base, "initial row");
 
     const days = [
@@ -771,25 +866,33 @@
       click(field);
       setVal(field, hours);
       enter(field);
-      await sleep(WAIT);
 
-      rowControls = await live(base, row, `${dayLabel} live`);
+      rowControls = await waitForRowState(
+        base,
+        row,
+        `${dayLabel} hours verification`,
+        (controlsNow) => hourValueMatches(controlsNow[keyName], hours),
+      );
       field = rowControls[keyName];
-      const observed = clean(field.value);
-      const decimal = Number(hours).toFixed(2);
-      if (observed !== clean(hours) && observed !== decimal) {
+      if (!hourValueMatches(field, hours)) {
         throw Error(`Row ${row + 1} ${dayLabel} hours not committed.`);
       }
 
       // Hour commits and Activity restoration can rerender dependent controls.
       // Revalidate both Activity and Attendance after each such transition.
       await ensureRowContext(data, row, base, `${dayLabel} hours`);
-      rowControls = await live(base, row, `${dayLabel} details`);
-      await details(rowControls[keyName], note, `Row ${row + 1} ${dayLabel}`);
-      await ensureRowContext(data, row, base, `${dayLabel} details`);
+      if (clean(note)) {
+        rowControls = await live(base, row, `${dayLabel} details`);
+        await details(rowControls[keyName], note, `Row ${row + 1} ${dayLabel}`);
+        await ensureRowContext(data, row, base, `${dayLabel} details`);
+      }
     }
 
     await ensureRowContext(data, row, base, "completed row");
+    return {
+      sourceRow: data.sourceRow,
+      mercuryAnchorId: base,
+    };
   }
 
   function frame() {
@@ -828,6 +931,7 @@
 
     (async () => {
       let done = 0;
+      const rowMappings = [];
       stopRequested = false;
       runWarnings.length = 0;
       confirmedAttendance.clear();
@@ -835,21 +939,18 @@
       try {
         for (let index = 0; index < message.rows.length; index++) {
           checkStopped();
-
-          if (index >= 5) {
-            const scrollDown = document.getElementById("WD023A-scrollV-Nxt");
-            if (!scrollDown)
-              throw Error("Mercury vertical scroll-down button not found.");
-            click(scrollDown);
-            await sleep(500);
-          }
-
           const destination = await findNextEmptyEngagementRow();
-          await process(message.rows[index], destination.rowIndex);
+          const mapping = await process(message.rows[index], destination);
+          rowMappings.push(mapping);
           done++;
         }
 
-        respond({ ok: true, completed: done, warnings: [...runWarnings] });
+        respond({
+          ok: true,
+          completed: done,
+          rowMappings,
+          warnings: [...runWarnings],
+        });
       } catch (error) {
         respond({
           ok: false,
@@ -903,6 +1004,27 @@
     };
   }
 
+  function hasExcelData(row) {
+    return Object.entries(row).some(
+      ([keyName, value]) => keyName !== "sourceRow" && clean(value) !== "",
+    );
+  }
+
+  function validateExcelRows(rows) {
+    const invalid = rows.find((row) => !row.engagement || !row.activity);
+    if (!invalid) return;
+
+    const missing = [
+      !invalid.engagement ? "Engagement ID" : "",
+      !invalid.activity ? "Activity ID" : "",
+    ].filter(Boolean);
+    throw Error(
+      `Excel row ${invalid.sourceRow} contains timesheet data but is missing ${missing.join(
+        " and ",
+      )}. Each populated Excel row must map to exactly one Mercury row.`,
+    );
+  }
+
   function overlay() {
     if (top !== window || document.getElementById("x2m-launcher")) return;
 
@@ -953,12 +1075,18 @@
         if (!sheet) throw Error('Worksheet "Mercury Upload" was not found.');
 
         const rows = XLSX.utils
-          .sheet_to_json(sheet, { range: 5, defval: "", raw: false })
+          .sheet_to_json(sheet, {
+            range: 5,
+            defval: "",
+            raw: false,
+            blankrows: true,
+          })
           .map(norm)
-          .filter((row) => row.engagement || row.activity);
+          .filter(hasExcelData);
         if (!rows.length) {
           throw Error('No data found in "Mercury Upload" starting at row 7.');
         }
+        validateExcelRows(rows);
 
         status.textContent = `Appending ${rows.length} row(s) at the next empty Engagement ID row...`;
         const output = await chrome.runtime.sendMessage({
@@ -966,10 +1094,23 @@
           rows,
         });
         if (!output?.ok) throw Error(output?.error || "Stopped");
+        if (
+          Array.isArray(output.rowMappings) &&
+          output.rowMappings.length !== rows.length
+        ) {
+          throw Error(
+            `Row mapping mismatch: ${rows.length} Excel rows were sent but ` +
+              `${output.rowMappings.length} Mercury rows were confirmed.`,
+          );
+        }
 
         const warnings = output.warnings || [];
+        const mappedCount = Array.isArray(output.rowMappings)
+          ? output.rowMappings.length
+          : output.completed;
         status.textContent =
-          `Completed ${output.completed}/${rows.length}\nFrame: ${output.frameLabel}` +
+          `Completed ${output.completed}/${rows.length} Excel rows\n` +
+          `Confirmed ${mappedCount} Mercury rows\nFrame: ${output.frameLabel}` +
           (warnings.length
             ? `\nWarnings (${warnings.length}):\n${warnings
                 .map((warning) => `• ${warning}`)
