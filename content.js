@@ -2,8 +2,10 @@
   "use strict";
 
   let stopRequested = false;
-  const VERSION = "2026-08-28.5";
-  const SETTLE = 180;
+  const VERSION = "2026-08-28.6";
+  const SETTLE = 120;
+  const INPUT_EVENT_PAUSE = 75;
+  const POST_ENTER_PAUSE = 320;
   const COMMIT_TIMEOUT = 3500;
   const ATTENDANCE_TIMEOUT = 1800;
   const ATTEMPTS = 3;
@@ -139,11 +141,26 @@
     element.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
-  function submit(element, value) {
+  async function pressEnterAndSettle(element) {
+    await sleep(INPUT_EVENT_PAUSE);
+    const replacement = element?.id
+      ? document.getElementById(element.id)
+      : null;
+    const target =
+      replacement ||
+      (element?.isConnected && element) ||
+      document.activeElement ||
+      document.body;
+    target.focus?.();
+    enter(target);
+    await sleep(POST_ENTER_PAUSE);
+  }
+
+  async function submit(element, value) {
     click(element);
     element.select?.();
     setVal(element, value);
-    enter(element);
+    await pressEnterAndSettle(element);
   }
 
   function waitFor(fn, label, ms = 5000) {
@@ -491,11 +508,13 @@
 
           if (exactOption) {
             click(exactOption);
+            await pressEnterAndSettle(
+              document.getElementById(field.id) || field,
+            );
           } else {
             field.focus();
             await typeKeys(field, expected);
-            await sleep(80);
-            enter(field);
+            await pressEnterAndSettle(field);
           }
 
           rowControls = await waitForRowState(
@@ -546,6 +565,9 @@
         let selectedExactOption = false;
         if (helpState.exactOption) {
           click(helpState.exactOption);
+          await pressEnterAndSettle(
+            document.getElementById(field.id) || field,
+          );
           selectedExactOption = true;
         } else {
           const editor = helpState.editor || field;
@@ -566,9 +588,12 @@
 
           if (exactOption) {
             click(exactOption);
+            await pressEnterAndSettle(
+              document.getElementById(field.id) || field,
+            );
             selectedExactOption = true;
           } else {
-            enter(editor);
+            await pressEnterAndSettle(editor);
           }
         }
 
@@ -624,7 +649,7 @@
       );
 
       if (clean(rowControls.activity.value) !== clean(data.activity)) {
-        submit(rowControls.activity, data.activity);
+        await submit(rowControls.activity, data.activity);
         rowControls = await waitForRowState(
           base,
           row,
@@ -830,7 +855,7 @@
     const base = destination.anchorId;
     confirmedAttendance.delete(base);
 
-    submit(anchor, data.engagement);
+    await submit(anchor, data.engagement);
     let rowControls = await waitForRowState(
       base,
       row,
@@ -838,7 +863,7 @@
       (controlsNow) =>
         clean(controlsNow.anchor.value) === clean(data.engagement),
     );
-    submit(rowControls.activity, data.activity);
+    await submit(rowControls.activity, data.activity);
     rowControls = await waitForRowState(
       base,
       row,
@@ -863,9 +888,7 @@
 
       rowControls = await live(base, row, dayLabel);
       let field = rowControls[keyName];
-      click(field);
-      setVal(field, hours);
-      enter(field);
+      await submit(field, hours);
 
       rowControls = await waitForRowState(
         base,
