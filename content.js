@@ -2,6 +2,7 @@
   "use strict";
 
   let stopRequested = false;
+  const VERSION = "2026-08-28.4";
   const WAIT = 750;
   const ATTEMPTS = 3;
   const runWarnings = [];
@@ -337,6 +338,28 @@
     }
   }
 
+  function isSapCombo(field) {
+    const controlType = clean(field?.getAttribute?.("ct")).toUpperCase();
+    return (
+      field instanceof HTMLInputElement &&
+      (controlType === "CB" ||
+        controlType === "CBS" ||
+        field.readOnly ||
+        field.hasAttribute("lsdata") ||
+        field.classList.contains("lsField__input"))
+    );
+  }
+
+  function controlDescription(field) {
+    return {
+      id: clean(field?.id),
+      ct: clean(field?.getAttribute?.("ct")),
+      className: clean(field?.className),
+      readOnly: !!field?.readOnly,
+      hasLsdata: !!field?.hasAttribute?.("lsdata"),
+    };
+  }
+
   function attendanceValueMatches(field, expected) {
     const wanted = comparable(expected);
     if (!wanted) return clean(field?.value) === "";
@@ -381,6 +404,7 @@
 
     let lastObserved = "";
     let lastError = null;
+    let lastControl = null;
 
     for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
       checkStopped();
@@ -391,6 +415,7 @@
           `Attendance attempt ${attempt}`,
         );
         const field = rowControls.attendance;
+        lastControl = controlDescription(field);
         const expectedId = add(base, 11);
         if (field.id !== expectedId) {
           throw Error(
@@ -407,7 +432,7 @@
         // only changes the display and does not update SAP's selected key.
         // Printable keyboard events drive the combo's native type-ahead, and
         // Enter commits the highlighted item into lsdata (key 4/text 5).
-        if (field.readOnly && field.getAttribute("ct") === "CB") {
+        if (isSapCombo(field)) {
           await sleep(300);
 
           let exactOption = null;
@@ -550,7 +575,8 @@
     throw Error(
       `Row ${row + 1} Attendance ${JSON.stringify(expected)} was not committed after ${ATTEMPTS} attempts` +
         `${lastObserved ? `; field contains ${JSON.stringify(lastObserved)}` : ""}` +
-        `${lastError?.message ? ` (${lastError.message})` : ""}.`,
+        `${lastError?.message ? ` (${lastError.message})` : ""}. ` +
+        `Control=${JSON.stringify(lastControl)}`,
     );
   }
 
@@ -888,12 +914,12 @@
     const launcher = document.createElement("button");
     launcher.id = "x2m-launcher";
     launcher.textContent = "X";
-    launcher.title = "Mercury Automation";
+    launcher.title = `Mercury Automation ${VERSION}`;
 
     const panel = document.createElement("section");
     panel.id = "x2m-panel";
     panel.innerHTML =
-      '<h2>Mercury Automation</h2><div>Select template file for import.</div><input id="x2m-file" type="file" accept=".xlsm,.xlsx,.xls"><button id="x2m-run">Run automation</button><button id="x2m-stop" disabled>Stop automation</button><div id="x2m-status">Ready.</div>';
+      `<h2>Mercury Automation</h2><div>Version ${VERSION}</div><div>Select template file for import.</div><input id="x2m-file" type="file" accept=".xlsm,.xlsx,.xls"><button id="x2m-run">Run automation</button><button id="x2m-stop" disabled>Stop automation</button><div id="x2m-status">Ready.</div>`;
     document.documentElement.append(panel, launcher);
     launcher.onclick = () => panel.classList.toggle("open");
 
