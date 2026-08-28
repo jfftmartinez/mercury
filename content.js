@@ -70,6 +70,30 @@
     );
   const f4 = (element) => key(element, "F4", "F4", 115);
 
+  async function typeKeys(element, text) {
+    for (const character of String(text)) {
+      let code;
+      let number;
+
+      if (/^[a-z]$/i.test(character)) {
+        code = `Key${character.toUpperCase()}`;
+        number = character.toUpperCase().charCodeAt(0);
+      } else if (/^[0-9]$/.test(character)) {
+        code = `Digit${character}`;
+        number = character.charCodeAt(0);
+      } else if (character === " ") {
+        code = "Space";
+        number = 32;
+      } else {
+        code = character;
+        number = character.charCodeAt(0);
+      }
+
+      key(element, character, code, number);
+      await sleep(35);
+    }
+  }
+
   function click(element) {
     if (!element) throw Error("Required Mercury control not found.");
     element.scrollIntoView({ block: "center", inline: "center" });
@@ -236,18 +260,35 @@
     const expected = comparable(text);
     const layer = valueHelpLayer();
     const root = layer || document;
-    const selector = layer
-      ? "[role='option'],[role='menuitem'],li,td,span,div,a"
-      : "[role='option'],[role='menuitem']";
+    const selector = "[role='option'],[role='menuitem'],li,td,span,div,a";
+    const fieldRect = field.getBoundingClientRect();
     return [
       ...root.querySelectorAll(selector),
     ]
       .filter(
-        (element) =>
-          element !== field &&
-          visible(element) &&
-          element.getAttribute("ct") !== "CB" &&
-          comparable(element.textContent) === expected,
+        (element) => {
+          if (
+            element === field ||
+            !visible(element) ||
+            element.getAttribute("ct") === "CB" ||
+            comparable(element.textContent) !== expected
+          ) {
+            return false;
+          }
+
+          if (layer) return true;
+
+          // SAP's combo popup does not consistently expose a dialog/listbox
+          // role. In that build, accept an exact-text element only when it is
+          // geometrically close to and below the Att./Abs combo field.
+          const rect = element.getBoundingClientRect();
+          return (
+            rect.top >= fieldRect.top - 8 &&
+            rect.top <= fieldRect.bottom + 600 &&
+            rect.right >= fieldRect.left - 80 &&
+            rect.left <= fieldRect.right + 700
+          );
+        },
       )
       .sort(
         (a, b) =>
@@ -281,15 +322,34 @@
       )[0];
   }
 
+  function comboState(field) {
+    const raw = field?.getAttribute?.("lsdata");
+    if (!raw) return { key: "", text: "" };
+
+    try {
+      const data = JSON.parse(raw);
+      return {
+        key: clean(data[4] ?? data["4"]),
+        text: clean(data[5] ?? data["5"]),
+      };
+    } catch (_) {
+      return { key: "", text: "" };
+    }
+  }
+
   function attendanceValueMatches(field, expected) {
     const wanted = comparable(expected);
     if (!wanted) return clean(field?.value) === "";
+
+    const state = comboState(field);
 
     const candidates = [
       field?.value,
       field?.getAttribute?.("value"),
       field?.title,
       field?.getAttribute?.("aria-label"),
+      state.key,
+      state.text,
     ].map(comparable);
 
     return candidates.some((candidate) => {
@@ -342,6 +402,62 @@
 
         click(field);
         f4(field);
+
+        // SAP renders this as a readonly ct="CB" combo box. Assigning .value
+        // only changes the display and does not update SAP's selected key.
+        // Printable keyboard events drive the combo's native type-ahead, and
+        // Enter commits the highlighted item into lsdata (key 4/text 5).
+        if (field.readOnly && field.getAttribute("ct") === "CB") {
+          await sleep(300);
+
+          let exactOption = null;
+          if (attempt !== 2) {
+            try {
+              exactOption = await waitFor(
+                () => option(expected, field),
+                `Row ${row + 1} exact Attendance option ${expected}`,
+                1800,
+              );
+            } catch (error) {
+              if (error?.name === "StopError") throw error;
+            }
+          }
+
+          if (exactOption) {
+            click(exactOption);
+          } else {
+            // The second attempt deliberately uses the independent keyboard
+            // route even if a matching DOM node was seen on attempt one.
+            field.focus();
+            await typeKeys(field, expected);
+            await sleep(250);
+            enter(field);
+          }
+          await sleep(WAIT);
+
+          rowControls = await live(
+            base,
+            row,
+            `Attendance combo verification attempt ${attempt}`,
+          );
+          lastObserved = clean(rowControls.attendance.value);
+
+          if (attendanceValueMatches(rowControls.attendance, expected)) {
+            confirmedAttendance.set(base, {
+              expected: comparable(expected),
+              display: lastObserved,
+            });
+            rowControls.mo.focus();
+            await sleep(150);
+            return rowControls;
+          }
+
+          const state = comboState(rowControls.attendance);
+          throw Error(
+            `combo did not commit; value=${JSON.stringify(lastObserved)}, ` +
+              `key=${JSON.stringify(state.key)}, text=${JSON.stringify(state.text)}`,
+          );
+        }
 
         let helpState;
         try {
