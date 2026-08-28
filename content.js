@@ -1,168 +1,223 @@
 (() => {
   "use strict";
+
   let stopRequested = false;
-  const WAIT = 750,
-    clean = (v) =>
-      String(v ?? "")
-        .trim()
-        .replace(/\s+/g, " "),
-    sleep = async (ms) => {
-      const end = Date.now() + ms;
-      while (Date.now() < end) {
-        checkStopped();
-        await new Promise((r) => setTimeout(r, Math.min(100, end - Date.now())));
-      }
-      checkStopped();
-    };
+  const WAIT = 750;
+  const ATTEMPTS = 3;
   const runWarnings = [];
+  const confirmedAttendance = new Map();
+
+  const clean = (v) =>
+    String(v ?? "")
+      .replace(/\u00a0/g, " ")
+      .trim()
+      .replace(/\s+/g, " ");
+
+  const comparable = (v) => clean(v).toLowerCase();
+
   function checkStopped() {
     if (!stopRequested) return;
     const error = new Error("Automation stopped by user.");
     error.name = "StopError";
     throw error;
   }
-  const visible = (e) => {
-    if (!e) return false;
-    const s = getComputedStyle(e),
-      r = e.getBoundingClientRect();
+
+  async function sleep(ms) {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      checkStopped();
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(100, end - Date.now())),
+      );
+    }
+    checkStopped();
+  }
+
+  const visible = (element) => {
+    if (!element) return false;
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
     return (
-      s.display !== "none" &&
-      s.visibility !== "hidden" &&
-      r.width > 0 &&
-      r.height > 0
+      style.display !== "none" &&
+      style.visibility !== "hidden" &&
+      rect.width > 0 &&
+      rect.height > 0
     );
   };
-  function key(e, k, c, n) {
-    ["keydown", "keypress", "keyup"].forEach((t) =>
-      e.dispatchEvent(
-        new KeyboardEvent(t, {
-          key: k,
-          code: c,
-          keyCode: n,
-          which: n,
+
+  function key(element, keyName, code, number) {
+    ["keydown", "keypress", "keyup"].forEach((type) =>
+      element.dispatchEvent(
+        new KeyboardEvent(type, {
+          key: keyName,
+          code,
+          keyCode: number,
+          which: number,
           bubbles: true,
           cancelable: true,
         }),
       ),
     );
   }
-  const enter = (e) => key(e, "Enter", "Enter", 13),
-    esc = (e) =>
-      key(e || document.activeElement || document.body, "Escape", "Escape", 27),
-    f4 = (e) => key(e, "F4", "F4", 115);
-  async function typeKeys(el, text) {
-    for (const ch of String(text)) {
-      const code = ch.toUpperCase().charCodeAt(0);
-      key(el, ch, `Key${ch.toUpperCase()}`, code);
-      await sleep(25);
-    }
-  }
-  function click(e) {
-    if (!e) throw Error("Required Mercury control not found.");
-    e.scrollIntoView({ block: "center", inline: "center" });
-    e.focus?.();
-    ["mousedown", "mouseup", "click"].forEach((t) =>
-      e.dispatchEvent(
-        new MouseEvent(t, {
+
+  const enter = (element) => key(element, "Enter", "Enter", 13);
+  const esc = (element) =>
+    key(
+      element || document.activeElement || document.body,
+      "Escape",
+      "Escape",
+      27,
+    );
+  const f4 = (element) => key(element, "F4", "F4", 115);
+
+  function click(element) {
+    if (!element) throw Error("Required Mercury control not found.");
+    element.scrollIntoView({ block: "center", inline: "center" });
+    element.focus?.();
+    ["mousedown", "mouseup", "click"].forEach((type) =>
+      element.dispatchEvent(
+        new MouseEvent(type, {
           view: window,
           bubbles: true,
           cancelable: true,
           button: 0,
-          buttons: t === "mousedown" ? 1 : 0,
+          buttons: type === "mousedown" ? 1 : 0,
         }),
       ),
     );
   }
-  function setVal(e, v) {
-    const x = String(v ?? ""),
-      set = Object.getOwnPropertyDescriptor(
-        HTMLInputElement.prototype,
-        "value",
-      )?.set;
-    if (set && e instanceof HTMLInputElement) set.call(e, x);
-    else e.value = x;
-    e.dispatchEvent(new Event("input", { bubbles: true }));
-    e.dispatchEvent(new Event("change", { bubbles: true }));
+
+  function setVal(element, value) {
+    const text = String(value ?? "");
+    const prototype =
+      element instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+
+    if (setter) setter.call(element, text);
+    else element.value = text;
+
+    try {
+      element.dispatchEvent(
+        new InputEvent("input", {
+          bubbles: true,
+          inputType: "insertText",
+          data: text,
+        }),
+      );
+    } catch (_) {
+      element.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    element.dispatchEvent(new Event("change", { bubbles: true }));
   }
-  function submit(e, v) {
-    click(e);
-    setVal(e, v);
-    enter(e);
+
+  function submit(element, value) {
+    click(element);
+    element.select?.();
+    setVal(element, value);
+    enter(element);
   }
+
   function waitFor(fn, label, ms = 5000) {
-    return new Promise((res, rej) => {
-      const st = Date.now(),
-        id = setInterval(() => {
-          let x;
-          try {
-            checkStopped();
-            x = fn();
-          } catch (_) {}
-          if (x) {
+    return new Promise((resolve, reject) => {
+      const started = Date.now();
+      const id = setInterval(() => {
+        let result;
+        try {
+          checkStopped();
+          result = fn();
+        } catch (error) {
+          if (error?.name === "StopError") {
             clearInterval(id);
-            res(x);
-          } else if (Date.now() - st >= ms) {
-            clearInterval(id);
-            rej(Error(`Timeout waiting for ${label}.`));
+            reject(error);
+            return;
           }
-        }, 40);
+        }
+
+        if (result) {
+          clearInterval(id);
+          resolve(result);
+        } else if (Date.now() - started >= ms) {
+          clearInterval(id);
+          reject(Error(`Timeout waiting for ${label}.`));
+        }
+      }, 50);
     });
   }
-  function add(id, n) {
-    const m = /^(WD)([0-9A-F]+)$/i.exec(id || "");
-    if (!m) throw Error(`Unexpected control ID ${id}`);
+
+  function add(id, amount) {
+    const match = /^(WD)([0-9A-F]+)$/i.exec(id || "");
+    if (!match) throw Error(`Unexpected control ID ${id}`);
     return (
-      m[1] +
-      (parseInt(m[2], 16) + n)
+      match[1] +
+      (parseInt(match[2], 16) + amount)
         .toString(16)
         .toUpperCase()
-        .padStart(m[2].length, "0")
+        .padStart(match[2].length, "0")
     );
   }
+
   function anchors() {
     return [...document.querySelectorAll('input[ct="CBS"][maxlength="40"]')]
-      .filter((e) => visible(e) && !e.readOnly && e.tabIndex >= 0)
+      .filter(
+        (element) =>
+          visible(element) && !element.readOnly && element.tabIndex >= 0,
+      )
       .sort(
-        (a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top,
+        (a, b) =>
+          a.getBoundingClientRect().top - b.getBoundingClientRect().top,
       );
   }
-  function sameRow(e, a) {
-    const x = e.getBoundingClientRect(),
-      y = a.getBoundingClientRect();
+
+  function sameRow(element, anchor) {
+    const elementRect = element.getBoundingClientRect();
+    const anchorRect = anchor.getBoundingClientRect();
     return (
-      visible(e) && Math.abs(x.top + x.height / 2 - (y.top + y.height / 2)) <= 6
+      visible(element) &&
+      Math.abs(
+        elementRect.top + elementRect.height / 2 -
+          (anchorRect.top + anchorRect.height / 2),
+      ) <= 6
     );
   }
+
   function controls(base, row) {
-    const a = document.getElementById(base);
-    if (!a) throw Error(`Row ${row + 1} anchor ${base} missing.`);
-    const activity = document.getElementById(add(base, 4)),
-      attendance = document.getElementById(add(base, 11));
-    const h = [...document.querySelectorAll('input[ct="CBS"][maxlength="20"]')]
-      .filter((e) => sameRow(e, a))
+    const anchor = document.getElementById(base);
+    if (!anchor) throw Error(`Row ${row + 1} anchor ${base} missing.`);
+
+    const activity = document.getElementById(add(base, 4));
+    const attendance = document.getElementById(add(base, 11));
+    const hours = [
+      ...document.querySelectorAll('input[ct="CBS"][maxlength="20"]'),
+    ]
+      .filter((element) => sameRow(element, anchor))
       .sort(
-        (x, y) =>
-          x.getBoundingClientRect().left - y.getBoundingClientRect().left,
+        (a, b) =>
+          a.getBoundingClientRect().left - b.getBoundingClientRect().left,
       )
       .slice(-7);
+
     if (!activity) throw Error(`Row ${row + 1} Activity missing.`);
     if (!attendance) throw Error(`Row ${row + 1} Attendance missing.`);
-    if (h.length !== 7)
-      throw Error(`Row ${row + 1} has ${h.length} hour fields.`);
+    if (hours.length !== 7)
+      throw Error(`Row ${row + 1} has ${hours.length} hour fields.`);
+
     return {
-      anchor: a,
+      anchor,
       activity,
       attendance,
-      hours: h,
-      sa: h[0],
-      su: h[1],
-      mo: h[2],
-      tu: h[3],
-      we: h[4],
-      th: h[5],
-      fr: h[6],
+      hours,
+      sa: hours[0],
+      su: hours[1],
+      mo: hours[2],
+      tu: hours[3],
+      we: hours[4],
+      th: hours[5],
+      fr: hours[6],
     };
   }
+
   async function live(base, row, label) {
     return waitFor(
       () => {
@@ -173,21 +228,26 @@
         }
       },
       `Row ${row + 1} ${label}`,
+      7000,
     );
   }
-  function option(txt, field) {
-    const v = clean(txt).toLowerCase();
+
+  function option(text, field) {
+    const expected = comparable(text);
+    const layer = valueHelpLayer();
+    const root = layer || document;
+    const selector = layer
+      ? "[role='option'],[role='menuitem'],li,td,span,div,a"
+      : "[role='option'],[role='menuitem']";
     return [
-      ...document.querySelectorAll(
-        "[role='option'],[role='menuitem'],li,td,span,div,a",
-      ),
+      ...root.querySelectorAll(selector),
     ]
       .filter(
-        (e) =>
-          e !== field &&
-          visible(e) &&
-          e.getAttribute("ct") !== "CB" &&
-          clean(e.textContent).toLowerCase() === v,
+        (element) =>
+          element !== field &&
+          visible(element) &&
+          element.getAttribute("ct") !== "CB" &&
+          comparable(element.textContent) === expected,
       )
       .sort(
         (a, b) =>
@@ -195,34 +255,229 @@
           b.getBoundingClientRect().width * b.getBoundingClientRect().height,
       )[0];
   }
-  async function attendance(data, row, base) {
-    let c = await live(base, row, "Attendance");
-    const expected = add(base, 11);
-    if (c.attendance.id !== expected)
-      throw Error(
-        `Row ${row + 1} wrong Attendance ${c.attendance.id}; expected ${expected}.`,
+
+  function editable(element) {
+    return (
+      element &&
+      visible(element) &&
+      !element.disabled &&
+      !element.readOnly &&
+      (element instanceof HTMLInputElement ||
+        element instanceof HTMLTextAreaElement)
+    );
+  }
+
+  function valueHelpLayer() {
+    return [
+      ...document.querySelectorAll(
+        '[role="listbox"],[role="dialog"],[role="menu"],.urPW,.lsPopupWindow,[ct="PW"],[ct="LB"]',
+      ),
+    ]
+      .filter(visible)
+      .sort(
+        (a, b) =>
+          a.getBoundingClientRect().width * a.getBoundingClientRect().height -
+          b.getBoundingClientRect().width * b.getBoundingClientRect().height,
+      )[0];
+  }
+
+  function attendanceValueMatches(field, expected) {
+    const wanted = comparable(expected);
+    if (!wanted) return clean(field?.value) === "";
+
+    const candidates = [
+      field?.value,
+      field?.getAttribute?.("value"),
+      field?.title,
+      field?.getAttribute?.("aria-label"),
+    ].map(comparable);
+
+    return candidates.some((candidate) => {
+      if (!candidate) return false;
+      if (candidate === wanted) return true;
+      return (
+        candidate.startsWith(`${wanted} `) ||
+        candidate.startsWith(`${wanted} -`) ||
+        candidate.startsWith(`${wanted} –`) ||
+        candidate.startsWith(`${wanted}:`)
+      );
+    });
+  }
+
+  function attendanceIsCurrent(base, field, expected) {
+    if (attendanceValueMatches(field, expected)) return true;
+
+    const confirmation = confirmedAttendance.get(base);
+    return (
+      confirmation?.expected === comparable(expected) &&
+      clean(field?.value) !== "" &&
+      clean(field?.value) === confirmation.display
+    );
+  }
+
+  async function selectAttendance(data, row, base) {
+    const expected = clean(data.att);
+    if (!expected) return live(base, row, "Attendance skipped");
+
+    let lastObserved = "";
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+      checkStopped();
+      try {
+        let rowControls = await live(
+          base,
+          row,
+          `Attendance attempt ${attempt}`,
+        );
+        const field = rowControls.attendance;
+        const expectedId = add(base, 11);
+        if (field.id !== expectedId) {
+          throw Error(
+            `wrong Attendance control ${field.id}; expected ${expectedId}`,
+          );
+        }
+
+        if (attendanceIsCurrent(base, field, expected)) return rowControls;
+
+        click(field);
+        f4(field);
+
+        let helpState;
+        try {
+          helpState = await waitFor(
+            () => {
+              const exactOption = option(expected, field);
+              if (exactOption) return { exactOption };
+
+              const active = document.activeElement;
+              if (active !== field && editable(active)) return { editor: active };
+
+              const layer = valueHelpLayer();
+              if (!layer) return null;
+              const editor = [...layer.querySelectorAll("input,textarea")].find(
+                editable,
+              );
+              return { editor: editor || field };
+            },
+            `Row ${row + 1} Attendance value help`,
+            3000,
+          );
+        } catch (error) {
+          if (error?.name === "StopError") throw error;
+          // Some Mercury builds keep focus in the field even though F4 opened
+          // its suggestion list. Continue with the field as the typing target.
+          helpState = { editor: field };
+        }
+
+        let selectedExactOption = false;
+        if (helpState.exactOption) {
+          click(helpState.exactOption);
+          selectedExactOption = true;
+        } else {
+          const editor = helpState.editor || field;
+          click(editor);
+          editor.select?.();
+          setVal(editor, expected);
+
+          let exactOption = null;
+          try {
+            exactOption = await waitFor(
+              () => option(expected, field),
+              `Row ${row + 1} Attendance option ${expected}`,
+              1800,
+            );
+          } catch (error) {
+            if (error?.name === "StopError") throw error;
+          }
+
+          if (exactOption) {
+            click(exactOption);
+            selectedExactOption = true;
+          } else {
+            enter(editor);
+          }
+        }
+
+        await sleep(WAIT);
+        rowControls = await live(
+          base,
+          row,
+          `Attendance verification attempt ${attempt}`,
+        );
+        lastObserved = clean(rowControls.attendance.value);
+
+        if (
+          attendanceValueMatches(rowControls.attendance, expected) ||
+          (selectedExactOption && lastObserved !== "")
+        ) {
+          confirmedAttendance.set(base, {
+            expected: comparable(expected),
+            display: lastObserved,
+          });
+          rowControls.mo.focus();
+          await sleep(150);
+          return rowControls;
+        }
+
+        throw Error(
+          `value was ${lastObserved ? JSON.stringify(lastObserved) : "blank"}`,
+        );
+      } catch (error) {
+        if (error?.name === "StopError") throw error;
+        lastError = error;
+        esc(document.activeElement || document.body);
+        await sleep(300 + attempt * 150);
+      }
+    }
+
+    throw Error(
+      `Row ${row + 1} Attendance ${JSON.stringify(expected)} was not committed after ${ATTEMPTS} attempts` +
+        `${lastObserved ? `; field contains ${JSON.stringify(lastObserved)}` : ""}` +
+        `${lastError?.message ? ` (${lastError.message})` : ""}.`,
+    );
+  }
+
+  async function ensureRowContext(data, row, base, label) {
+    for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+      checkStopped();
+      let rowControls = await live(
+        base,
+        row,
+        `${label} context attempt ${attempt}`,
       );
 
-    // Requested keyboard workflow:
-    // Activity ID -> Tab equivalent -> Attendance -> F4 -> type value -> Enter
-    // -> Tab equivalent -> Monday.
-    // Direct focus is used for the two Tab steps because synthetic Tab events
-    // do not reliably move focus in Chromium content scripts.
-    c.attendance.focus();
-    f4(c.attendance);
-    await sleep(300);
+      if (clean(rowControls.activity.value) !== clean(data.activity)) {
+        submit(rowControls.activity, data.activity);
+        await sleep(WAIT);
+        rowControls = await live(base, row, `${label} Activity verification`);
+      }
 
-    const typingTarget = document.activeElement || c.attendance;
-    await typeKeys(typingTarget, data.att);
-    await sleep(200);
-    enter(document.activeElement || typingTarget);
-    await sleep(500);
+      if (
+        clean(data.att) &&
+        !attendanceIsCurrent(base, rowControls.attendance, data.att)
+      ) {
+        rowControls = await selectAttendance(data, row, base);
+      }
 
-    c = await live(base, row, "Monday after Attendance keyboard selection");
-    c.mo.focus();
-    await sleep(180);
-    // Intentionally no Attendance retention validation.
+      rowControls = await live(base, row, `${label} final verification`);
+      const activityOk =
+        clean(rowControls.activity.value) === clean(data.activity);
+      const attendanceOk =
+        !clean(data.att) ||
+        attendanceIsCurrent(base, rowControls.attendance, data.att);
+
+      if (activityOk && attendanceOk) return rowControls;
+    }
+
+    const rowControls = await live(base, row, `${label} failed context`);
+    throw Error(
+      `Row ${row + 1} context did not stabilize. ` +
+        `Activity=${JSON.stringify(clean(rowControls.activity.value))}, ` +
+        `Attendance=${JSON.stringify(clean(rowControls.attendance.value))}.`,
+    );
   }
+
   function focusables(scope = document) {
     return [
       ...scope.querySelectorAll(
@@ -230,12 +485,14 @@
       ),
     ].filter(visible);
   }
-  function next(e, scope = document) {
-    const a = focusables(scope),
-      n = a[a.indexOf(e) + 1];
-    n?.focus?.();
-    return n;
+
+  function next(element, scope = document) {
+    const elements = focusables(scope);
+    const nextElement = elements[elements.indexOf(element) + 1];
+    nextElement?.focus?.();
+    return nextElement;
   }
+
   function popup() {
     return [
       ...document.querySelectorAll(
@@ -243,72 +500,70 @@
       ),
     ]
       .filter(visible)
-      .filter((e) => clean(e.textContent).toLowerCase().includes("details"))
+      .filter((element) =>
+        comparable(element.textContent).includes("details"),
+      )
       .sort(
         (a, b) =>
           a.getBoundingClientRect().width * a.getBoundingClientRect().height -
           b.getBoundingClientRect().width * b.getBoundingClientRect().height,
       )[0];
   }
+
   async function details(hour, text, label) {
     if (!clean(text)) return true;
 
     let lastError = null;
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        // Reproduce the proven flow exactly:
-        // hour -> Tab-equivalent details icon -> Enter -> popup -> Note -> Tab-equivalent OK -> Enter.
         hour.focus();
         const trigger = next(hour);
         if (!trigger) throw Error(`${label} details trigger missing.`);
         enter(trigger);
-        await sleep(300);
 
-        const p = await waitFor(popup, `${label} popup`, 5000);
-        const ed = await waitFor(
+        const detailsPopup = await waitFor(popup, `${label} popup`, 5000);
+        const editor = await waitFor(
           () => {
-            const a = document.activeElement;
-            if (
-              a &&
-              visible(a) &&
-              !a.readOnly &&
-              (a instanceof HTMLInputElement ||
-                a instanceof HTMLTextAreaElement)
-            )
-              return a;
-            return [...p.querySelectorAll("textarea,input[type='text']")]
+            const active = document.activeElement;
+            if (editable(active)) return active;
+            return [...detailsPopup.querySelectorAll("textarea,input[type='text']")]
               .filter(visible)
-              .find((e) => !e.readOnly);
+              .find((element) => !element.readOnly);
           },
           `${label} note`,
           5000,
         );
 
-        ed.focus();
-        setVal(ed, text);
+        editor.focus();
+        setVal(editor, text);
         await sleep(120);
 
-        let ok =
-          next(ed) ||
-          focusables(p).find(
-            (e) =>
-              clean(
-                e.innerText || e.textContent || e.value || e.title,
-              ).toLowerCase() === "ok",
+        const ok =
+          next(editor) ||
+          focusables(detailsPopup).find(
+            (element) =>
+              comparable(
+                element.innerText ||
+                  element.textContent ||
+                  element.value ||
+                  element.title,
+              ) === "ok",
           );
         if (!ok) throw Error(`${label} OK missing.`);
         enter(ok);
-        await sleep(500);
-        await waitFor(() => !visible(p), `${label} popup close`, 5000);
+        await sleep(400);
+        await waitFor(
+          () => !visible(detailsPopup),
+          `${label} popup close`,
+          5000,
+        );
         return true;
       } catch (error) {
+        if (error?.name === "StopError") throw error;
         lastError = error;
         if (attempt === 1) {
-          // Dismiss any partial popup/focus state, reacquire the live hour field
-          // in the caller, and try the same sequence once more.
           esc(document.activeElement || document.body);
           await sleep(250);
-          continue;
         }
       }
     }
@@ -319,19 +574,11 @@
     return false;
   }
 
-  async function restore(data, row, base) {
-    let c = await live(base, row, "Activity");
-    if (clean(c.activity.value) !== clean(data.activity)) {
-      submit(c.activity, data.activity);
-      await sleep(WAIT);
-    }
-  }
   async function findNextEmptyEngagementRow() {
     return waitFor(
       () => {
         const rows = anchors();
         const rowIndex = rows.findIndex((anchor) => clean(anchor.value) === "");
-
         if (rowIndex === -1) return null;
 
         const anchor = rows[rowIndex];
@@ -348,19 +595,23 @@
   }
 
   async function process(data, row) {
-    const a = anchors()[row];
-    if (!a) throw Error(`Mercury row ${row + 1} missing.`);
-    if (clean(a.value) !== "")
+    const anchor = anchors()[row];
+    if (!anchor) throw Error(`Mercury row ${row + 1} missing.`);
+    if (clean(anchor.value) !== "")
       throw Error(`Mercury row ${row + 1} is no longer empty.`);
-    const base = a.id;
-    submit(a, data.engagement);
+
+    const base = anchor.id;
+    confirmedAttendance.delete(base);
+
+    submit(anchor, data.engagement);
     await sleep(WAIT);
-    let c = await live(base, row, "Activity");
-    submit(c.activity, data.activity);
+
+    let rowControls = await live(base, row, "Activity");
+    submit(rowControls.activity, data.activity);
     await sleep(WAIT);
-    await attendance(data, row, base);
-    await restore(data, row, base);
-    const ds = [
+    await ensureRowContext(data, row, base, "initial row");
+
+    const days = [
       ["Saturday", "sa", data.sa, data.saD],
       ["Sunday", "su", data.su, data.suD],
       ["Monday", "mo", data.mo, data.moD],
@@ -369,26 +620,36 @@
       ["Thursday", "th", data.th, data.thD],
       ["Friday", "fr", data.fr, data.frD],
     ];
-    for (const [label, k, h, d] of ds) {
-      if (!clean(h)) continue;
-      c = await live(base, row, label);
-      let f = c[k];
-      click(f);
-      setVal(f, h);
-      enter(f);
+
+    for (const [dayLabel, keyName, hours, note] of days) {
+      if (!clean(hours)) continue;
+
+      rowControls = await live(base, row, dayLabel);
+      let field = rowControls[keyName];
+      click(field);
+      setVal(field, hours);
+      enter(field);
       await sleep(WAIT);
-      c = await live(base, row, `${label} live`);
-      f = c[k];
-      const v = clean(f.value),
-        x = Number(h).toFixed(2);
-      if (v !== clean(h) && v !== x)
-        throw Error(`Row ${row + 1} ${label} hours not committed.`);
-      await restore(data, row, base);
-      c = await live(base, row, `${label} details`);
-      await details(c[k], d, `Row ${row + 1} ${label}`);
-      await restore(data, row, base);
+
+      rowControls = await live(base, row, `${dayLabel} live`);
+      field = rowControls[keyName];
+      const observed = clean(field.value);
+      const decimal = Number(hours).toFixed(2);
+      if (observed !== clean(hours) && observed !== decimal) {
+        throw Error(`Row ${row + 1} ${dayLabel} hours not committed.`);
+      }
+
+      // Hour commits and Activity restoration can rerender dependent controls.
+      // Revalidate both Activity and Attendance after each such transition.
+      await ensureRowContext(data, row, base, `${dayLabel} hours`);
+      rowControls = await live(base, row, `${dayLabel} details`);
+      await details(rowControls[keyName], note, `Row ${row + 1} ${dayLabel}`);
+      await ensureRowContext(data, row, base, `${dayLabel} details`);
     }
+
+    await ensureRowContext(data, row, base, "completed row");
   }
+
   function frame() {
     try {
       return window.frameElement?.id || window.name || "";
@@ -396,142 +657,190 @@
       return window.name || "";
     }
   }
+
   function probe() {
-    const a = anchors(),
-      id = frame();
+    const rows = anchors();
+    const id = frame();
     return {
-      valid: a.length > 0 && !!document.getElementById(add(a[0]?.id, 11)),
-      score: a.length + (id ? 2 : 0),
+      valid:
+        rows.length > 0 && !!document.getElementById(add(rows[0]?.id, 11)),
+      score: rows.length + (id ? 2 : 0),
       frameElementId: id,
     };
   }
-  chrome.runtime.onMessage.addListener((m, s, r) => {
-    if (m?.type === "STOP") {
+
+  chrome.runtime.onMessage.addListener((message, sender, respond) => {
+    if (message?.type === "STOP") {
       stopRequested = true;
       esc(document.activeElement || document.body);
-      r({ ok: true });
+      respond({ ok: true });
       return;
     }
-    if (m?.type === "PROBE") {
-      r(probe());
+
+    if (message?.type === "PROBE") {
+      respond(probe());
       return;
     }
-    if (m?.type !== "EXEC") return;
+
+    if (message?.type !== "EXEC") return;
+
     (async () => {
       let done = 0;
       stopRequested = false;
       runWarnings.length = 0;
+      confirmedAttendance.clear();
+
       try {
-        for (let i = 0; i < m.rows.length; i++) {
+        for (let index = 0; index < message.rows.length; index++) {
           checkStopped();
-          // Records 1-5 do not scroll. Starting with record 6, click once,
-          // wait 500 ms, and only then find the next blank Engagement ID.
-          if (i >= 5) {
+
+          if (index >= 5) {
             const scrollDown = document.getElementById("WD023A-scrollV-Nxt");
             if (!scrollDown)
               throw Error("Mercury vertical scroll-down button not found.");
             click(scrollDown);
             await sleep(500);
           }
-          // Re-scan before every record because Mercury can rerender or activate
-          // new rows after the previous record is committed.
+
           const destination = await findNextEmptyEngagementRow();
-          await process(m.rows[i], destination.rowIndex);
+          await process(message.rows[index], destination.rowIndex);
           done++;
         }
-        r({ ok: true, completed: done, warnings: [...runWarnings] });
-      } catch (e) {
-        r({
+
+        respond({ ok: true, completed: done, warnings: [...runWarnings] });
+      } catch (error) {
+        respond({
           ok: false,
           completed: done,
-          error: e.name === "StopError" ? e.message : `Excel row ${m.rows[done]?.sourceRow || "unknown"}: ${e.message}`,
+          error:
+            error.name === "StopError"
+              ? error.message
+              : `Excel row ${message.rows[done]?.sourceRow || "unknown"}: ${error.message}`,
           warnings: [...runWarnings],
         });
       }
     })();
     return true;
   });
-  function val(r, ...ns) {
-    const k = Object.keys(r).find((k) =>
-      ns.some((n) => clean(k).toLowerCase() === n.toLowerCase()),
+
+  function val(row, ...names) {
+    const keyName = Object.keys(row).find((key) =>
+      names.some((name) => comparable(key) === comparable(name)),
     );
-    return k ? r[k] : "";
+    return keyName ? row[keyName] : "";
   }
-  function norm(r, i) {
+
+  function norm(row, index) {
     return {
-      sourceRow: i + 7,
-      engagement: clean(val(r, "Engagement ID")),
-      activity: clean(val(r, "Activity ID")),
-      att: clean(val(r, "Att./Abs. Type.")),
-      sa: clean(val(r, "SA XX")),
-      saD: clean(val(r, "Details")),
-      su: clean(val(r, "Su XX")),
-      suD: clean(val(r, "Details_1")),
-      mo: clean(val(r, "Mo XX")),
-      moD: clean(val(r, "Details_2")),
-      tu: clean(val(r, "Tu XX")),
-      tuD: clean(val(r, "Details_3")),
-      we: clean(val(r, "We XX")),
-      weD: clean(val(r, "Details_4")),
-      th: clean(val(r, "Th XX")),
-      thD: clean(val(r, "Details_5")),
-      fr: clean(val(r, "Fr XX")),
-      frD: clean(val(r, "Details_6")),
+      sourceRow: index + 7,
+      engagement: clean(val(row, "Engagement ID")),
+      activity: clean(val(row, "Activity ID")),
+      att: clean(
+        val(
+          row,
+          "Att./Abs. Type.",
+          "Att./Abs. Type",
+          "Att/Abs Type",
+          "Attendance Type",
+        ),
+      ),
+      sa: clean(val(row, "SA XX")),
+      saD: clean(val(row, "Details")),
+      su: clean(val(row, "Su XX")),
+      suD: clean(val(row, "Details_1")),
+      mo: clean(val(row, "Mo XX")),
+      moD: clean(val(row, "Details_2")),
+      tu: clean(val(row, "Tu XX")),
+      tuD: clean(val(row, "Details_3")),
+      we: clean(val(row, "We XX")),
+      weD: clean(val(row, "Details_4")),
+      th: clean(val(row, "Th XX")),
+      thD: clean(val(row, "Details_5")),
+      fr: clean(val(row, "Fr XX")),
+      frD: clean(val(row, "Details_6")),
     };
   }
+
   function overlay() {
     if (top !== window || document.getElementById("x2m-launcher")) return;
-    const s = document.createElement("style");
-    s.textContent =
+
+    const style = document.createElement("style");
+    style.textContent =
       "#x2m-launcher{position:fixed;right:22px;bottom:22px;width:58px;height:58px;border:0;border-radius:50%;z-index:2147483647;background:#107c41;box-shadow:0 8px 24px #0005;cursor:pointer;color:#fff;font:bold 24px Segoe UI}#x2m-panel{position:fixed;right:22px;bottom:92px;width:330px;z-index:2147483647;background:#fff;border-radius:15px;box-shadow:0 15px 40px #0005;padding:16px;font:13px Segoe UI;display:none}#x2m-panel.open{display:block}#x2m-panel input,#x2m-panel button{width:100%;box-sizing:border-box;margin-top:9px}#x2m-panel button{padding:10px;border:0;border-radius:7px;background:#107c41;color:#fff;font-weight:700}#x2m-stop{background:#c42b1c}#x2m-panel button:disabled{opacity:.55;cursor:not-allowed}#x2m-status{white-space:pre-wrap;margin-top:10px;background:#f3f3f3;padding:9px;border-radius:7px}";
-    document.documentElement.appendChild(s);
-    const l = document.createElement("button");
-    l.id = "x2m-launcher";
-    l.textContent = "X";
-    l.title = "Mercury Automation";
-    const p = document.createElement("section");
-    p.id = "x2m-panel";
-    p.innerHTML =
+    document.documentElement.appendChild(style);
+
+    const launcher = document.createElement("button");
+    launcher.id = "x2m-launcher";
+    launcher.textContent = "X";
+    launcher.title = "Mercury Automation";
+
+    const panel = document.createElement("section");
+    panel.id = "x2m-panel";
+    panel.innerHTML =
       '<h2>Mercury Automation</h2><div>Select template file for import.</div><input id="x2m-file" type="file" accept=".xlsm,.xlsx,.xls"><button id="x2m-run">Run automation</button><button id="x2m-stop" disabled>Stop automation</button><div id="x2m-status">Ready.</div>';
-    document.documentElement.append(p, l);
-    l.onclick = () => p.classList.toggle("open");
-    const f = p.querySelector("#x2m-file"),
-      b = p.querySelector("#x2m-run"),
-      stop = p.querySelector("#x2m-stop"),
-      st = p.querySelector("#x2m-status");
-    stop.onclick = async () => {
-      stop.disabled = true;
-      st.textContent = "Stopping automation...";
-      const out = await chrome.runtime.sendMessage({ type: "STOP" });
-      if (!out?.ok) st.textContent = `Unable to stop: ${out?.error || "Unknown error"}`;
+    document.documentElement.append(panel, launcher);
+    launcher.onclick = () => panel.classList.toggle("open");
+
+    const fileInput = panel.querySelector("#x2m-file");
+    const runButton = panel.querySelector("#x2m-run");
+    const stopButton = panel.querySelector("#x2m-stop");
+    const status = panel.querySelector("#x2m-status");
+
+    stopButton.onclick = async () => {
+      stopButton.disabled = true;
+      status.textContent = "Stopping automation...";
+      const output = await chrome.runtime.sendMessage({ type: "STOP" });
+      if (!output?.ok) {
+        status.textContent = `Unable to stop: ${output?.error || "Unknown error"}`;
+      }
     };
-    b.onclick = async () => {
-      if (!f.files[0])
-        return (st.textContent = "Select an XLSM, XLSX, or XLS file first.");
-      b.disabled = true;
-      stop.disabled = false;
+
+    runButton.onclick = async () => {
+      if (!fileInput.files[0]) {
+        status.textContent = "Select an XLSM, XLSX, or XLS file first.";
+        return;
+      }
+
+      runButton.disabled = true;
+      stopButton.disabled = false;
       try {
-        const w = XLSX.read(await f.files[0].arrayBuffer(), { type: "array" }),
-          sh = w.Sheets["Mercury Upload"];
-        if (!sh) throw Error('Worksheet "Mercury Upload" was not found.');
-        const rs = XLSX.utils
-          .sheet_to_json(sh, { range: 5, defval: "", raw: false })
+        const workbook = XLSX.read(await fileInput.files[0].arrayBuffer(), {
+          type: "array",
+        });
+        const sheet = workbook.Sheets["Mercury Upload"];
+        if (!sheet) throw Error('Worksheet "Mercury Upload" was not found.');
+
+        const rows = XLSX.utils
+          .sheet_to_json(sheet, { range: 5, defval: "", raw: false })
           .map(norm)
-          .filter((x) => x.engagement || x.activity);
-        if (!rs.length)
+          .filter((row) => row.engagement || row.activity);
+        if (!rows.length) {
           throw Error('No data found in "Mercury Upload" starting at row 7.');
-        st.textContent = `Appending ${rs.length} row(s) at the next empty Engagement ID row...`;
-        const out = await chrome.runtime.sendMessage({ type: "RUN", rows: rs });
-        if (!out?.ok) throw Error(out?.error || "Stopped");
-        const warnings = out.warnings || [];
-        st.textContent = `Completed ${out.completed}/${rs.length}\nFrame: ${out.frameLabel}${warnings.length ? `\nWarnings (${warnings.length}):\n${warnings.map((x) => `• ${x}`).join("\n")}` : ""}`;
-      } catch (e) {
-        st.textContent = `Stopped: ${e.message}`;
+        }
+
+        status.textContent = `Appending ${rows.length} row(s) at the next empty Engagement ID row...`;
+        const output = await chrome.runtime.sendMessage({
+          type: "RUN",
+          rows,
+        });
+        if (!output?.ok) throw Error(output?.error || "Stopped");
+
+        const warnings = output.warnings || [];
+        status.textContent =
+          `Completed ${output.completed}/${rows.length}\nFrame: ${output.frameLabel}` +
+          (warnings.length
+            ? `\nWarnings (${warnings.length}):\n${warnings
+                .map((warning) => `• ${warning}`)
+                .join("\n")}`
+            : "");
+      } catch (error) {
+        status.textContent = `Stopped: ${error.message}`;
       } finally {
-        b.disabled = false;
-        stop.disabled = true;
+        runButton.disabled = false;
+        stopButton.disabled = true;
       }
     };
   }
+
   overlay();
 })();
